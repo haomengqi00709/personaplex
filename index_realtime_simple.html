@@ -1,0 +1,272 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>PersonaPlex 实时翻译</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            max-width: 800px;
+            margin: 50px auto;
+            padding: 20px;
+        }
+        .container {
+            background: #f5f5f5;
+            padding: 20px;
+            border-radius: 10px;
+        }
+        button {
+            padding: 10px 20px;
+            margin: 10px 5px;
+            font-size: 16px;
+            cursor: pointer;
+            border: none;
+            border-radius: 5px;
+            background: #4CAF50;
+            color: white;
+        }
+        button:hover {
+            background: #45a049;
+        }
+        button.recording {
+            background: #f44336;
+        }
+        select {
+            padding: 8px;
+            margin: 10px 5px;
+            font-size: 14px;
+        }
+        .status {
+            margin: 10px 0;
+            padding: 10px;
+            background: #e0e0e0;
+            border-radius: 5px;
+        }
+    </style>
+    <script src="https://cdn.socket.io/4.5.4/socket.io.min.js"></script>
+</head>
+<body>
+    <div class="container">
+        <h1>PersonaPlex 实时翻译</h1>
+        
+        <div class="status" id="status">状态: 未连接</div>
+        
+        <div>
+            <button id="loadModelBtn">加载模型</button>
+            <span id="modelStatus"></span>
+        </div>
+        
+        <div style="margin: 20px 0;">
+            <label>源语言:</label>
+            <select id="sourceLang">
+                <option value="en">英语</option>
+                <option value="zh">中文</option>
+            </select>
+            
+            <label>目标语言:</label>
+            <select id="targetLang">
+                <option value="zh">中文</option>
+                <option value="en">英语</option>
+            </select>
+        </div>
+        
+        <div>
+            <button id="recordBtn">🎙️ 开始录音</button>
+        </div>
+        
+        <div id="output" style="margin-top: 20px; padding: 10px; background: white; border-radius: 5px; min-height: 100px;">
+            <p>翻译结果将显示在这里...</p>
+        </div>
+    </div>
+
+    <script>
+        const socket = io();
+        let isRecording = false;
+        let audioContext = null;
+        let processor = null;
+        let stream = null;
+        let audioChunks = [];
+        let sendInterval = null;
+
+        // Socket.IO 连接
+        socket.on('connect', () => {
+            document.getElementById('status').textContent = '状态: 已连接';
+        });
+
+        socket.on('disconnect', () => {
+            document.getElementById('status').textContent = '状态: 未连接';
+        });
+
+        socket.on('translated_audio', (data) => {
+            // 播放翻译后的音频
+            const audio = new Audio('data:audio/wav;base64,' + data.audio);
+            audio.play();
+        });
+
+        // 加载模型
+        async function loadModel() {
+            try {
+                const response = await fetch('/api/load_model', { method: 'POST' });
+                const result = await response.json();
+                document.getElementById('modelStatus').textContent = result.message;
+            } catch (error) {
+                console.error('加载模型失败:', error);
+            }
+        }
+
+        // 开始录音
+        async function startRecording() {
+            try {
+                stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+                audioContext = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 24000 });
+                const source = audioContext.createMediaStreamSource(stream);
+                processor = audioContext.createScriptProcessor(4096, 1, 1);
+                
+                audioChunks = [];
+                
+                processor.onaudioprocess = (e) => {
+                    const inputData = e.inputBuffer.getChannelData(0);
+                    audioChunks.push(new Float32Array(inputData));
+                };
+                
+                source.connect(processor);
+                processor.connect(audioContext.destination);
+                
+                // 定期发送音频数据
+                sendInterval = setInterval(() => {
+                    if (audioChunks.length > 0) {
+                        // 合并音频块
+                        const totalLength = audioChunks.reduce((sum, chunk) => sum + chunk.length, 0);
+                        const merged = new Float32Array(totalLength);
+                        let offset = 0;
+                        for (const chunk of audioChunks) {
+                            merged.set(chunk, offset);
+                            offset += chunk.length;
+                        }
+                        audioChunks = [];
+                        
+                        // 转换为 WAV
+                        const wavBuffer = audioBufferToWav({
+                            numberOfChannels: 1,
+                            length: merged.length,
+                            sampleRate: 24000,
+                            getChannelData: (ch) => {
+                                if (ch === 0) return merged;
+                                return new Float32Array(merged.length);
+                            }
+                        });
+                        
+                        // 转换为数组并发送
+                        const uint8Array = new Uint8Array(wavBuffer);
+                        const audioArray = Array.from(uint8Array);
+                        
+                            // 验证文件头
+                            if (audioArray.length >= 4) {
+                                const headerStr = String.fromCharCode(
+                                    audioArray[0], audioArray[1], audioArray[2], audioArray[3]
+                                );
+                                console.log('准备发送音频，文件头:', headerStr, '大小:', audioArray.length);
+                                
+                                if (headerStr === 'RIFF') {
+                                    const sourceLang = document.getElementById('sourceLang').value;
+                                    const targetLang = document.getElementById('targetLang').value;
+                                    
+                                    console.log('发送音频数据，数组长度:', audioArray.length);
+                                    socket.emit('audio_chunk', {
+                                        audio: audioArray,
+                                        source_lang: sourceLang,
+                                        target_lang: targetLang
+                                    });
+                                } else {
+                                    console.error('音频文件头无效:', headerStr);
+                                }
+                            } else {
+                                console.error('音频数据太短:', audioArray.length);
+                            }
+                    }
+                }, 3000);
+                
+                isRecording = true;
+                document.getElementById('recordBtn').textContent = '⏹️ 停止录音';
+                document.getElementById('recordBtn').classList.add('recording');
+                
+            } catch (error) {
+                console.error('录音失败:', error);
+                alert('无法访问麦克风: ' + error.message);
+            }
+        }
+
+        // 停止录音
+        function stopRecording() {
+            if (isRecording) {
+                if (processor) processor.disconnect();
+                if (stream) stream.getTracks().forEach(track => track.stop());
+                if (audioContext) audioContext.close();
+                if (sendInterval) clearInterval(sendInterval);
+                
+                isRecording = false;
+                document.getElementById('recordBtn').textContent = '🎙️ 开始录音';
+                document.getElementById('recordBtn').classList.remove('recording');
+            }
+        }
+
+        // 将音频数据转换为 WAV
+        function audioBufferToWav(buffer) {
+            const numOfChan = buffer.numberOfChannels || 1;
+            const sampleRate = buffer.sampleRate || 24000;
+            const length = buffer.length;
+            const dataLength = length * numOfChan * 2;
+            const arrayBuffer = new ArrayBuffer(44 + dataLength);
+            const view = new DataView(arrayBuffer);
+            let pos = 0;
+
+            const setUint16 = (data) => {
+                view.setUint16(pos, data, true);
+                pos += 2;
+            };
+            const setUint32 = (data) => {
+                view.setUint32(pos, data, true);
+                pos += 4;
+            };
+
+            // WAV 文件头
+            setUint32(0x46464952); // "RIFF"
+            setUint32(36 + dataLength);
+            setUint32(0x45564157); // "WAVE"
+            setUint32(0x20746d66); // "fmt "
+            setUint32(16);
+            setUint16(1); // PCM
+            setUint16(numOfChan);
+            setUint32(sampleRate);
+            setUint32(sampleRate * 2 * numOfChan);
+            setUint16(numOfChan * 2);
+            setUint16(16);
+            setUint32(0x61746164); // "data"
+            setUint32(dataLength);
+
+            // 写入 PCM 数据
+            const channelData = buffer.getChannelData(0);
+            for (let i = 0; i < length; i++) {
+                let sample = Math.max(-1, Math.min(1, channelData[i]));
+                sample = sample < 0 ? sample * 0x8000 : sample * 0x7FFF;
+                view.setInt16(pos, sample, true);
+                pos += 2;
+            }
+
+            return arrayBuffer;
+        }
+
+        // 事件监听
+        document.getElementById('loadModelBtn').addEventListener('click', loadModel);
+        document.getElementById('recordBtn').addEventListener('click', () => {
+            if (isRecording) {
+                stopRecording();
+            } else {
+                startRecording();
+            }
+        });
+    </script>
+</body>
+</html>
+
