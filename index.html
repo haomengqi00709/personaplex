@@ -191,12 +191,13 @@
         let sendInterval = null;
         let silenceThreshold = 0.005; // 静音阈值（降低默认值，更敏感）
         let minAudioLength = 0.3; // 最小音频长度（秒），降低到0.3秒
-        let maxSilenceFrames = 30; // 连续静音帧数，增加这个值
         let currentRMS = 0; // 当前音量
         let maxRMS = 0; // 最大音量（用于显示）
         let consecutiveSilenceCount = 0; // 连续静音计数
-        let silenceThresholdFrames = 15; // 连续静音多少帧后认为说话结束（约0.5秒，24000/4096*15）
+        let silenceThresholdFrames = 8; // 连续静音多少帧后认为说话结束（约0.17秒，24000/4096*8）- 减少以更快响应
         let hasSpeechInBuffer = false; // 缓冲区中是否有语音
+        let lastSpeechTime = 0; // 最后一次检测到语音的时间
+        let maxAudioDuration = 4.0; // 最大音频长度（秒），超过这个长度立即发送
 
         // 计算音频音量（RMS）
         function calculateRMS(audioData) {
@@ -362,12 +363,14 @@
                     if (hasSpeech) {
                         hasSpeechInBuffer = true;
                         consecutiveSilenceCount = 0;
+                        lastSpeechTime = Date.now(); // 更新最后语音时间
                     } else {
                         consecutiveSilenceCount++;
                     }
                     
-                    // 限制音频块数量，避免内存溢出（增加到200，允许更长的句子）
-                    if (audioChunks.length > 200) {
+                    // 限制音频块数量，避免内存溢出（限制到约4秒，24000*4/4096≈23块）
+                    const maxChunks = Math.ceil(24000 * maxAudioDuration / 4096); // 约23块
+                    if (audioChunks.length > maxChunks) {
                         audioChunks.shift(); // 移除最旧的块
                     }
                 };
@@ -375,7 +378,7 @@
                 source.connect(processor);
                 processor.connect(audioContext.destination);
                 
-                // 智能发送：检测到静音后发送，而不是固定时间间隔
+                // 智能发送：检测到静音后立即发送，避免积累过长音频
                 sendInterval = setInterval(() => {
                     if (audioChunks.length > 0) {
                         // 合并音频块
@@ -391,17 +394,19 @@
                         const audioDuration = merged.length / 24000; // 秒
                         const rms = calculateRMS(merged);
                         const hasSpeech = rms > silenceThreshold;
+                        const timeSinceLastSpeech = (Date.now() - lastSpeechTime) / 1000; // 秒
                         
-                        // 如果检测到连续静音，且之前有语音，则发送（等待用户说完）
-                        const shouldSend = hasSpeechInBuffer && 
-                                         consecutiveSilenceCount >= silenceThresholdFrames && 
-                                         audioDuration >= minAudioLength;
+                        // 条件1: 检测到连续静音，且之前有语音，则立即发送（用户说完了）
+                        const shouldSendOnSilence = hasSpeechInBuffer && 
+                                                   consecutiveSilenceCount >= silenceThresholdFrames && 
+                                                   audioDuration >= minAudioLength &&
+                                                   timeSinceLastSpeech >= 0.2; // 至少0.2秒没说话了
                         
-                        // 或者音频太长（超过8秒），强制发送（避免内存问题）
-                        const forceSend = audioDuration >= 8.0 && hasSpeech;
+                        // 条件2: 音频达到最大长度（4秒），立即发送（避免积累太长）
+                        const shouldSendOnMaxLength = audioDuration >= maxAudioDuration && hasSpeechInBuffer;
                         
                         // 只在有有效语音且满足发送条件时才发送
-                        if ((shouldSend || forceSend) && audioDuration >= minAudioLength) {
+                        if ((shouldSendOnSilence || shouldSendOnMaxLength) && audioDuration >= minAudioLength) {
                             // 转换为 WAV
                             const wavBuffer = audioBufferToWav({
                                 numberOfChannels: 1,
@@ -428,8 +433,9 @@
                                     const targetLang = document.getElementById('targetLang').value;
                                     
                                     const sendTime = new Date().toLocaleTimeString();
-                                    console.log(`✓ [DEBUG] 发送音频数据 | 时间: ${sendTime} | RMS: ${rms.toFixed(4)} | 长度: ${audioDuration.toFixed(2)}秒 | 大小: ${audioArray.length} 字节`);
-                                    document.getElementById('audioStatus').textContent = '发送中...';
+                                    const reason = shouldSendOnMaxLength ? '达到最大长度' : '检测到静音';
+                                    console.log(`✓ [DEBUG] 发送音频数据 | 时间: ${sendTime} | 原因: ${reason} | RMS: ${rms.toFixed(4)} | 长度: ${audioDuration.toFixed(2)}秒 | 距离最后语音: ${timeSinceLastSpeech.toFixed(2)}秒`);
+                                    document.getElementById('audioStatus').textContent = `发送中... (${reason})`;
                                     document.getElementById('audioStatus').style.color = 'blue';
                                     
                                     socket.emit('audio_chunk', {
@@ -445,6 +451,8 @@
                                     audioChunks = [];
                                     hasSpeechInBuffer = false;
                                     consecutiveSilenceCount = 0;
+                                    lastSpeechTime = 0;
+                                    maxRMS = 0; // 重置最大音量
                                 } else {
                                     console.error('音频文件头无效:', headerStr);
                                 }
@@ -455,13 +463,13 @@
                                 // 继续收集，不发送
                             } else if (!hasSpeechInBuffer) {
                                 // 没有语音，清空缓冲区（避免积累太多静音）
-                                if (audioChunks.length > 10) {
-                                    audioChunks = audioChunks.slice(-5);
+                                if (audioChunks.length > 5) {
+                                    audioChunks = audioChunks.slice(-3);
                                 }
                             }
                         }
                     }
-                }, 500); // 更频繁地检查（500ms），但只在满足条件时发送
+                }, 200); // 更频繁地检查（200ms），更快响应静音
                 
                 isRecording = true;
                 maxRMS = 0; // 重置最大音量
