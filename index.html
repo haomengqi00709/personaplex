@@ -71,6 +71,14 @@
             </select>
         </div>
         
+        <div style="margin: 10px 0;">
+            <label>静音阈值:</label>
+            <input type="range" id="silenceThreshold" min="0.001" max="0.1" step="0.001" value="0.01" 
+                   oninput="document.getElementById('thresholdValue').textContent = this.value">
+            <span id="thresholdValue">0.01</span>
+            <small style="display: block; color: #666;">值越小越敏感，建议 0.01-0.03</small>
+        </div>
+        
         <div>
             <button id="recordBtn">🎙️ 开始录音</button>
         </div>
@@ -88,6 +96,25 @@
         let stream = null;
         let audioChunks = [];
         let sendInterval = null;
+        let silenceThreshold = 0.01; // 静音阈值（可调整，0.01 表示非常安静）
+        let minAudioLength = 0.5; // 最小音频长度（秒），避免发送太短的音频
+        let consecutiveSilenceFrames = 0;
+        let maxSilenceFrames = 10; // 连续静音帧数，超过这个值才认为是静音
+
+        // 计算音频音量（RMS）
+        function calculateRMS(audioData) {
+            let sum = 0;
+            for (let i = 0; i < audioData.length; i++) {
+                sum += audioData[i] * audioData[i];
+            }
+            return Math.sqrt(sum / audioData.length);
+        }
+
+        // 检测是否有有效语音
+        function hasValidSpeech(audioData) {
+            const rms = calculateRMS(audioData);
+            return rms > silenceThreshold;
+        }
 
         // Socket.IO 连接
         socket.on('connect', () => {
@@ -127,13 +154,26 @@
                 
                 processor.onaudioprocess = (e) => {
                     const inputData = e.inputBuffer.getChannelData(0);
-                    audioChunks.push(new Float32Array(inputData));
+                    // 检测是否有声音
+                    const rms = calculateRMS(inputData);
+                    const hasSpeech = rms > silenceThreshold;
+                    
+                    if (hasSpeech) {
+                        consecutiveSilenceFrames = 0;
+                        audioChunks.push(new Float32Array(inputData));
+                    } else {
+                        consecutiveSilenceFrames++;
+                        // 即使静音，也保留一些音频块，以便在语音结束时发送
+                        if (consecutiveSilenceFrames < maxSilenceFrames) {
+                            audioChunks.push(new Float32Array(inputData));
+                        }
+                    }
                 };
                 
                 source.connect(processor);
                 processor.connect(audioContext.destination);
                 
-                // 定期发送音频数据
+                // 定期发送音频数据（只在有有效语音时发送）
                 sendInterval = setInterval(() => {
                     if (audioChunks.length > 0) {
                         // 合并音频块
@@ -144,46 +184,60 @@
                             merged.set(chunk, offset);
                             offset += chunk.length;
                         }
-                        audioChunks = [];
                         
-                        // 转换为 WAV
-                        const wavBuffer = audioBufferToWav({
-                            numberOfChannels: 1,
-                            length: merged.length,
-                            sampleRate: 24000,
-                            getChannelData: (ch) => {
-                                if (ch === 0) return merged;
-                                return new Float32Array(merged.length);
-                            }
-                        });
+                        // 检查音频长度和是否有有效语音
+                        const audioDuration = merged.length / 24000; // 秒
+                        const hasSpeech = hasValidSpeech(merged);
                         
-                        // 转换为数组并发送
-                        const uint8Array = new Uint8Array(wavBuffer);
-                        const audioArray = Array.from(uint8Array);
-                        
-                        // 验证文件头
-                        if (audioArray.length >= 4) {
-                            const headerStr = String.fromCharCode(
-                                audioArray[0], audioArray[1], audioArray[2], audioArray[3]
-                            );
-                            console.log('准备发送音频，文件头:', headerStr, '大小:', audioArray.length);
+                        // 只在有有效语音且长度足够时才发送
+                        if (hasSpeech && audioDuration >= minAudioLength) {
+                            // 转换为 WAV
+                            const wavBuffer = audioBufferToWav({
+                                numberOfChannels: 1,
+                                length: merged.length,
+                                sampleRate: 24000,
+                                getChannelData: (ch) => {
+                                    if (ch === 0) return merged;
+                                    return new Float32Array(merged.length);
+                                }
+                            });
                             
-                            if (headerStr === 'RIFF') {
-                                const sourceLang = document.getElementById('sourceLang').value;
-                                const targetLang = document.getElementById('targetLang').value;
+                            // 转换为数组并发送
+                            const uint8Array = new Uint8Array(wavBuffer);
+                            const audioArray = Array.from(uint8Array);
+                            
+                            // 验证文件头
+                            if (audioArray.length >= 4) {
+                                const headerStr = String.fromCharCode(
+                                    audioArray[0], audioArray[1], audioArray[2], audioArray[3]
+                                );
                                 
-                                console.log('发送音频数据，数组长度:', audioArray.length);
-                                socket.emit('audio_chunk', {
-                                    audio: audioArray,
-                                    source_lang: sourceLang,
-                                    target_lang: targetLang
-                                });
-                            } else {
-                                console.error('音频文件头无效:', headerStr);
+                                if (headerStr === 'RIFF') {
+                                    const sourceLang = document.getElementById('sourceLang').value;
+                                    const targetLang = document.getElementById('targetLang').value;
+                                    
+                                    const rms = calculateRMS(merged);
+                                    console.log('发送音频数据，RMS:', rms.toFixed(4), '长度:', audioDuration.toFixed(2), '秒');
+                                    socket.emit('audio_chunk', {
+                                        audio: audioArray,
+                                        source_lang: sourceLang,
+                                        target_lang: targetLang
+                                    });
+                                } else {
+                                    console.error('音频文件头无效:', headerStr);
+                                }
                             }
                         } else {
-                            console.error('音频数据太短:', audioArray.length);
+                            if (!hasSpeech) {
+                                console.log('跳过静音音频，RMS 太低');
+                            } else {
+                                console.log('跳过太短的音频:', audioDuration.toFixed(2), '秒');
+                            }
                         }
+                        
+                        // 清空音频块
+                        audioChunks = [];
+                        consecutiveSilenceFrames = 0;
                     }
                 }, 3000);
                 
@@ -265,6 +319,12 @@
             } else {
                 startRecording();
             }
+        });
+        
+        // 更新静音阈值
+        document.getElementById('silenceThreshold').addEventListener('input', (e) => {
+            silenceThreshold = parseFloat(e.target.value);
+            document.getElementById('thresholdValue').textContent = silenceThreshold.toFixed(3);
         });
     </script>
 </body>
