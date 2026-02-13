@@ -272,9 +272,9 @@ def process_audio_chunk(audio_data, text_prompt, voice_prompt_path=None):
             global conversation_active, last_audio_time
             current_time = time.time()
             
-            # 如果距离上次处理超过10秒，认为是新对话（增加时间窗口，减少重新初始化）
+            # 如果距离上次处理超过30秒，认为是新对话（大幅增加时间窗口，减少重新初始化）
             time_since_last = current_time - last_audio_time if last_audio_time > 0 else 999
-            is_new_conversation = not conversation_active or time_since_last > 10.0
+            is_new_conversation = not conversation_active or time_since_last > 30.0
             
             if not is_new_conversation:
                 print(f"⏱️  [TIME] 距离上次请求: {time_since_last:.1f}秒（继续对话，跳过初始化）")
@@ -639,8 +639,8 @@ def handle_audio_chunk(data):
         
         pending_request_time = current_time
         
-        # 创建提示词 - 简单对话测试
-        text_prompt = "You enjoy having a good conversation."
+        # 创建提示词 - 更明确的对话指令
+        text_prompt = "You are a helpful and friendly conversational AI. Respond naturally to what the user says. Do not introduce yourself or say hello unless the user greets you first. Keep your responses concise and relevant to the conversation."
         
         # 定义回调函数
         def send_result(response_audio):
