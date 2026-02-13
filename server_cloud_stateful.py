@@ -22,6 +22,9 @@ import sentencepiece
 
 warnings.filterwarnings("ignore")
 
+# 设置 PyTorch CUDA 内存分配配置，减少内存碎片
+os.environ.setdefault('PYTORCH_CUDA_ALLOC_CONF', 'expandable_segments:True')
+
 # 检查并设置 Hugging Face Token
 if not os.environ.get('HF_TOKEN'):
     print("⚠️  警告: HF_TOKEN 环境变量未设置")
@@ -197,11 +200,14 @@ def process_audio_chunk(audio_data, text_prompt, voice_prompt_path=None):
         print("✗ 模型未加载")
         return None
     
-    # 检查音频长度（限制最大长度）
-    max_samples = model_state['sample_rate'] * 15  # 最多15秒
+    # 检查音频长度（限制最大长度，减少内存使用）
+    max_samples = model_state['sample_rate'] * 5  # 最多5秒（减少内存压力）
     if len(audio_data) > max_samples:
         print(f"⚠️  音频太长 ({len(audio_data)} 采样点)，截断到 {max_samples}")
         audio_data = audio_data[:max_samples]
+    
+    # 处理前清理 CUDA 缓存
+    clear_memory()
     
     try:
         with model_lock:
@@ -259,7 +265,9 @@ def process_audio_chunk(audio_data, text_prompt, voice_prompt_path=None):
             
             # 将音频分成帧并处理（保持 float32）
             all_pcm_data = audio_tensor[0].cpu().numpy().astype(np.float32)
+            del audio_tensor  # 释放内存
             
+            frame_count = 0
             while all_pcm_data.shape[-1] >= frame_size:
                 chunk = all_pcm_data[:frame_size]
                 all_pcm_data = all_pcm_data[frame_size:]
@@ -270,6 +278,7 @@ def process_audio_chunk(audio_data, text_prompt, voice_prompt_path=None):
                 # 编码
                 codes = mimi.encode(chunk_tensor)
                 _ = other_mimi.encode(chunk_tensor)
+                del chunk_tensor  # 释放内存
                 
                 # 逐步处理每个 codebook
                 for c in range(codes.shape[-1]):
@@ -282,6 +291,16 @@ def process_audio_chunk(audio_data, text_prompt, voice_prompt_path=None):
                     _ = other_mimi.decode(tokens[:, 1:9])
                     pcm = pcm.detach().cpu().numpy()[0, 0]
                     generated_frames.append(pcm)
+                    del pcm  # 释放 GPU 内存
+                
+                del codes  # 释放内存
+                frame_count += 1
+                
+                # 每处理10帧清理一次缓存
+                if frame_count % 10 == 0:
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                    gc.collect()
             
             # 处理剩余的音频
             if all_pcm_data.shape[-1] > 0:
@@ -291,6 +310,7 @@ def process_audio_chunk(audio_data, text_prompt, voice_prompt_path=None):
                 chunk_tensor = torch.from_numpy(chunk.astype(np.float32)).float().to(device)[None, None]
                 codes = mimi.encode(chunk_tensor)
                 _ = other_mimi.encode(chunk_tensor)
+                del chunk_tensor
                 for c in range(codes.shape[-1]):
                     tokens = lm_gen.step(codes[:, :, c: c + 1])
                     if tokens is None:
@@ -299,6 +319,8 @@ def process_audio_chunk(audio_data, text_prompt, voice_prompt_path=None):
                     _ = other_mimi.decode(tokens[:, 1:9])
                     pcm = pcm.detach().cpu().numpy()[0, 0]
                     generated_frames.append(pcm)
+                    del pcm
+                del codes
             
             # 合并所有生成的帧
             if generated_frames:
@@ -306,18 +328,36 @@ def process_audio_chunk(audio_data, text_prompt, voice_prompt_path=None):
             else:
                 output_audio = np.array([], dtype=np.float32)
             
+            # 清理内存
+            del generated_frames
+            del all_pcm_data
+            clear_memory()
+            
             elapsed = time.time() - start_time
             print(f"✓ 处理完成（耗时 {elapsed:.1f} 秒）")
             
             return output_audio
             
+    except torch.cuda.OutOfMemoryError as e:
+        print(f"✗ GPU 内存不足: {e}")
+        print("正在清理内存...")
+        clear_memory()
+        # 尝试再次清理
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
+        gc.collect()
+        return None
     except Exception as e:
         print(f"处理错误: {e}")
         import traceback
         traceback.print_exc()
+        clear_memory()
         return None
     finally:
         is_processing = False
+        # 最后清理一次
+        clear_memory()
 
 def process_queue():
     """处理队列中的请求"""
