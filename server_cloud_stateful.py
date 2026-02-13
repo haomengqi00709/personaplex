@@ -1,5 +1,5 @@
 """
-PersonaPlex 实时翻译 - 云端 GPU 版本（保持模型状态）
+PersonaPlex 实时对话 - 云端 GPU 版本（保持模型状态）
 在启动时加载模型一次，保持状态，避免每次重新加载
 """
 
@@ -45,6 +45,17 @@ model_lock = threading.Lock()
 conversation_active = False  # 跟踪是否有活跃对话
 last_audio_time = 0  # 上次处理音频的时间
 
+# 调试统计
+debug_stats = {
+    'total_requests': 0,
+    'successful_requests': 0,
+    'failed_requests': 0,
+    'total_processing_time': 0.0,
+    'last_request_time': None,
+    'last_processing_time': 0.0,
+    'memory_usage_mb': 0.0,
+}
+
 # 自动检测设备（优先 CUDA，云端 GPU 使用）
 device = "cuda" if torch.cuda.is_available() else ("mps" if hasattr(torch.backends, 'mps') and torch.backends.mps.is_available() else "cpu")
 
@@ -58,6 +69,18 @@ else:
 processing_queue = queue.Queue(maxsize=1)  # 最多1个请求排队（减少同时回复）
 is_processing = False
 pending_requests = set()  # 跟踪正在处理的请求（用于去重）
+
+def get_memory_usage():
+    """获取内存使用情况（MB）"""
+    if torch.cuda.is_available():
+        allocated = torch.cuda.memory_allocated() / 1024**2
+        reserved = torch.cuda.memory_reserved() / 1024**2
+        return {
+            'allocated_mb': round(allocated, 2),
+            'reserved_mb': round(reserved, 2),
+            'free_mb': round((torch.cuda.get_device_properties(0).total_memory / 1024**2) - reserved, 2)
+        }
+    return {'allocated_mb': 0, 'reserved_mb': 0, 'free_mb': 0}
 
 def clear_memory():
     """清理内存"""
@@ -197,11 +220,21 @@ def load_personaplex_model():
 
 def process_audio_chunk(audio_data, text_prompt, voice_prompt_path=None):
     """处理音频块 - 使用已加载的模型状态"""
-    global model_state
+    global model_state, debug_stats
+    
+    request_start_time = time.time()
+    debug_stats['total_requests'] += 1
+    debug_stats['last_request_time'] = time.strftime('%H:%M:%S')
     
     if model_state is None:
-        print("✗ 模型未加载")
+        print("✗ [ERROR] 模型未加载")
+        debug_stats['failed_requests'] += 1
         return None
+    
+    # 记录内存使用
+    mem_info = get_memory_usage()
+    debug_stats['memory_usage_mb'] = mem_info['allocated_mb']
+    print(f"📊 [DEBUG] 请求 #{debug_stats['total_requests']} | 内存: {mem_info['allocated_mb']:.1f}MB / {mem_info['reserved_mb']:.1f}MB | 可用: {mem_info['free_mb']:.1f}MB")
     
     # 检查音频长度（限制最大长度，减少内存使用）
     # 增加到10秒，允许更长的句子
@@ -230,7 +263,8 @@ def process_audio_chunk(audio_data, text_prompt, voice_prompt_path=None):
             is_new_conversation = not conversation_active or (current_time - last_audio_time) > 5.0
             
             if is_new_conversation:
-                print("🔄 开始新对话，初始化系统提示...")
+                print(f"🔄 [NEW_CONV] 开始新对话 #{debug_stats['total_requests']}，初始化系统提示...")
+                init_start = time.time()
                 # 重置流式状态（开始新对话）
                 mimi.reset_streaming()
                 other_mimi.reset_streaming()
@@ -261,8 +295,10 @@ def process_audio_chunk(audio_data, text_prompt, voice_prompt_path=None):
                 lm_gen.step_system_prompts(mimi)
                 mimi.reset_streaming()  # 重置 mimi 流式状态
                 conversation_active = True
+                init_time = time.time() - init_start
+                print(f"✓ [INIT] 系统提示初始化完成，耗时: {init_time:.2f}秒")
             else:
-                print("➡️  继续对话，跳过系统提示初始化")
+                print(f"➡️  [CONTINUE] 继续对话 #{debug_stats['total_requests']}，跳过系统提示初始化")
                 # 继续对话，只重置流式状态，不重新运行系统提示
                 mimi.reset_streaming()
                 other_mimi.reset_streaming()
@@ -270,7 +306,8 @@ def process_audio_chunk(audio_data, text_prompt, voice_prompt_path=None):
             
             last_audio_time = current_time
             
-            print(f"开始处理音频（{len(audio_data)} 采样点，约 {len(audio_data)/sample_rate:.1f} 秒）...")
+            audio_duration = len(audio_data) / sample_rate
+            print(f"🎤 [AUDIO] 开始处理音频 | 采样点: {len(audio_data)} | 时长: {audio_duration:.2f}秒")
             start_time = time.time()
             
             # 处理音频帧
@@ -289,6 +326,10 @@ def process_audio_chunk(audio_data, text_prompt, voice_prompt_path=None):
             del audio_tensor  # 释放内存
             
             frame_count = 0
+            encode_time = 0
+            decode_time = 0
+            step_time = 0
+            
             while all_pcm_data.shape[-1] >= frame_size:
                 chunk = all_pcm_data[:frame_size]
                 all_pcm_data = all_pcm_data[frame_size:]
@@ -297,19 +338,25 @@ def process_audio_chunk(audio_data, text_prompt, voice_prompt_path=None):
                 chunk_tensor = torch.from_numpy(chunk.astype(np.float32)).float().to(device)[None, None]  # (1, 1, frame_size)
                 
                 # 编码
+                encode_start = time.time()
                 codes = mimi.encode(chunk_tensor)
                 _ = other_mimi.encode(chunk_tensor)
+                encode_time += time.time() - encode_start
                 del chunk_tensor  # 释放内存
                 
                 # 逐步处理每个 codebook
                 for c in range(codes.shape[-1]):
+                    step_start = time.time()
                     tokens = lm_gen.step(codes[:, :, c: c + 1])
+                    step_time += time.time() - step_start
                     if tokens is None:
                         continue
                     
                     # 解码音频
+                    decode_start = time.time()
                     pcm = mimi.decode(tokens[:, 1:9])
                     _ = other_mimi.decode(tokens[:, 1:9])
+                    decode_time += time.time() - decode_start
                     pcm = pcm.detach().cpu().numpy()[0, 0]
                     generated_frames.append(pcm)
                     del pcm  # 释放 GPU 内存
@@ -322,6 +369,9 @@ def process_audio_chunk(audio_data, text_prompt, voice_prompt_path=None):
                     if torch.cuda.is_available():
                         torch.cuda.empty_cache()
                     gc.collect()
+            
+            if frame_count > 0:
+                print(f"📈 [PROCESS] 处理了 {frame_count} 帧 | 编码: {encode_time:.2f}s | 推理: {step_time:.2f}s | 解码: {decode_time:.2f}s")
             
             # 处理剩余的音频
             if all_pcm_data.shape[-1] > 0:
@@ -355,13 +405,26 @@ def process_audio_chunk(audio_data, text_prompt, voice_prompt_path=None):
             clear_memory()
             
             elapsed = time.time() - start_time
-            print(f"✓ 处理完成（耗时 {elapsed:.1f} 秒）")
+            total_time = time.time() - request_start_time
+            output_duration = len(output_audio) / sample_rate if len(output_audio) > 0 else 0
+            
+            debug_stats['last_processing_time'] = elapsed
+            debug_stats['total_processing_time'] += elapsed
+            debug_stats['successful_requests'] += 1
+            
+            # 更新内存信息
+            mem_info = get_memory_usage()
+            print(f"✓ [DONE] 处理完成 | 总耗时: {total_time:.2f}s | 处理耗时: {elapsed:.2f}s | 输出时长: {output_duration:.2f}s")
+            print(f"📊 [MEMORY] 处理后内存: {mem_info['allocated_mb']:.1f}MB / {mem_info['reserved_mb']:.1f}MB | 可用: {mem_info['free_mb']:.1f}MB")
             
             return output_audio
             
     except torch.cuda.OutOfMemoryError as e:
-        print(f"✗ GPU 内存不足: {e}")
-        print("正在清理内存...")
+        debug_stats['failed_requests'] += 1
+        mem_info = get_memory_usage()
+        print(f"✗ [OOM] GPU 内存不足 | 已分配: {mem_info['allocated_mb']:.1f}MB | 已保留: {mem_info['reserved_mb']:.1f}MB")
+        print(f"   [OOM] 错误详情: {str(e)[:200]}")
+        print("   [OOM] 正在清理内存...")
         clear_memory()
         # 尝试再次清理
         if torch.cuda.is_available():
@@ -370,7 +433,8 @@ def process_audio_chunk(audio_data, text_prompt, voice_prompt_path=None):
         gc.collect()
         return None
     except Exception as e:
-        print(f"处理错误: {e}")
+        debug_stats['failed_requests'] += 1
+        print(f"✗ [ERROR] 处理错误: {type(e).__name__}: {str(e)}")
         import traceback
         traceback.print_exc()
         clear_memory()
@@ -395,11 +459,16 @@ def process_queue():
             audio_data, text_prompt, source_lang, target_lang, callback = item
             
             # 处理音频
-            translated_audio = process_audio_chunk(audio_data, text_prompt)
+            print(f"🔄 [QUEUE] 开始处理队列中的请求...")
+            response_audio = process_audio_chunk(audio_data, text_prompt)
             
             # 回调发送结果
             if callback:
-                callback(translated_audio)
+                if response_audio is not None and len(response_audio) > 0:
+                    print(f"📤 [SEND] 发送响应音频，长度: {len(response_audio)} 采样点")
+                else:
+                    print(f"⚠️  [SEND] 响应音频为空，不发送")
+                callback(response_audio)
             
             # 标记处理完成
             is_processing = False
@@ -433,13 +502,24 @@ def get_status():
             'gpu_memory_gb': round(torch.cuda.get_device_properties(0).total_memory / 1024**3, 1)
         }
     
+    mem_info = get_memory_usage()
+    avg_processing_time = 0.0
+    if debug_stats['successful_requests'] > 0:
+        avg_processing_time = debug_stats['total_processing_time'] / debug_stats['successful_requests']
+    
     return jsonify({
         'model_loaded': model_state is not None,
         'device': device,
         'cuda_available': torch.cuda.is_available(),
         'cuda_info': cuda_info,
         'queue_size': processing_queue.qsize(),
-        'is_processing': is_processing
+        'is_processing': is_processing,
+        'conversation_active': conversation_active,
+        'debug_stats': {
+            **debug_stats,
+            'avg_processing_time': round(avg_processing_time, 2),
+            'memory_info': mem_info
+        }
     })
 
 @app.route('/api/load_model', methods=['POST'])
@@ -455,11 +535,11 @@ def load_model():
 
 @socketio.on('connect')
 def handle_connect():
-    print('客户端已连接')
+    print(f'🔌 [CONNECT] 客户端已连接 | 时间: {time.strftime("%H:%M:%S")}')
 
 @socketio.on('disconnect')
 def handle_disconnect():
-    print('客户端已断开')
+    print(f'🔌 [DISCONNECT] 客户端已断开 | 时间: {time.strftime("%H:%M:%S")}')
 
 @socketio.on('audio_chunk')
 def handle_audio_chunk(data):
@@ -497,7 +577,8 @@ def handle_audio_chunk(data):
         try:
             # 明确指定 dtype 为 float32
             audio_data, sr = librosa.load(temp_path, sr=model_state['sample_rate'], dtype=np.float32)
-            print(f"收到音频: {len(audio_data)} 采样点 ({len(audio_data)/sr:.1f} 秒)")
+            audio_duration = len(audio_data) / sr
+            print(f"📥 [RECEIVE] 收到音频 | 采样点: {len(audio_data)} | 时长: {audio_duration:.2f}秒 | 时间: {time.strftime('%H:%M:%S')}")
         except Exception as e:
             print(f"音频加载错误: {e}")
             socketio.emit('audio_error', {'error': f'Audio load error: {str(e)}'})
@@ -508,7 +589,7 @@ def handle_audio_chunk(data):
         
         # 检查队列是否已满或正在处理
         if processing_queue.full() or is_processing:
-            print("⚠️  正在处理其他请求，跳过此请求（避免重复回复）")
+            print(f"⚠️  [SKIP] 正在处理其他请求，跳过此请求 | 队列大小: {processing_queue.qsize()} | 正在处理: {is_processing}")
             socketio.emit('audio_error', {'error': 'Another request is being processed, please wait'})
             return
         
@@ -516,11 +597,12 @@ def handle_audio_chunk(data):
         text_prompt = "You enjoy having a good conversation."
         
         # 定义回调函数
-        def send_result(translated_audio):
-            if translated_audio is not None and len(translated_audio) > 0:
+        def send_result(response_audio):
+            send_start = time.time()
+            if response_audio is not None and len(response_audio) > 0:
                 try:
                     output_temp = tempfile.NamedTemporaryFile(delete=False, suffix='.wav')
-                    sf.write(output_temp.name, translated_audio, model_state['sample_rate'])
+                    sf.write(output_temp.name, response_audio, model_state['sample_rate'])
                     output_temp.close()
                     
                     with open(output_temp.name, 'rb') as f:
@@ -528,20 +610,23 @@ def handle_audio_chunk(data):
                     os.unlink(output_temp.name)
                     
                     audio_base64 = base64.b64encode(audio_bytes).decode('utf-8')
+                    response_duration = len(response_audio) / model_state['sample_rate']
                     socketio.emit('translated_audio', {'audio': audio_base64})
-                    print("✓ 已发送翻译结果")
+                    send_time = time.time() - send_start
+                    print(f"✓ [SENT] 已发送对话响应 | 时长: {response_duration:.2f}秒 | 大小: {len(audio_bytes)} 字节 | 发送耗时: {send_time:.3f}秒")
                 except Exception as e:
-                    print(f"发送结果错误: {e}")
+                    print(f"✗ [SEND_ERROR] 发送结果错误: {type(e).__name__}: {str(e)}")
                     socketio.emit('audio_error', {'error': f'Failed to send result: {str(e)}'})
             else:
-                socketio.emit('audio_error', {'error': 'Translation failed or empty result'})
+                print(f"⚠️  [SEND_ERROR] 响应音频为空，不发送")
+                socketio.emit('audio_error', {'error': 'Response failed or empty result'})
         
         # 添加到处理队列
         try:
             processing_queue.put_nowait((audio_data, text_prompt, source_lang, target_lang, send_result))
-            print(f"✓ 已添加到处理队列（队列大小: {processing_queue.qsize()}）")
+            print(f"✓ [QUEUE] 已添加到处理队列 | 队列大小: {processing_queue.qsize()} | 等待处理...")
         except queue.Full:
-            print("⚠️  队列已满")
+            print(f"⚠️  [QUEUE] 队列已满，无法添加新请求")
             socketio.emit('audio_error', {'error': 'Processing queue is full'})
         
     except Exception as e:
@@ -555,7 +640,7 @@ if __name__ == '__main__':
     port = int(sys.argv[1]) if len(sys.argv) > 1 else 5001
     
     print("=" * 60)
-    print("PersonaPlex 实时翻译 - 云端 GPU 版本（保持模型状态）")
+    print("PersonaPlex 实时对话 - 云端 GPU 版本（保持模型状态）")
     print("=" * 60)
     if torch.cuda.is_available():
         print(f"✓ 使用 CUDA GPU: {torch.cuda.get_device_name(0)}")

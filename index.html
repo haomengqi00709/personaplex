@@ -43,12 +43,50 @@
             background: #e0e0e0;
             border-radius: 5px;
         }
+        .debug-panel {
+            margin: 20px 0;
+            padding: 15px;
+            background: #f9f9f9;
+            border: 1px solid #ddd;
+            border-radius: 5px;
+            font-family: monospace;
+            font-size: 12px;
+            max-height: 300px;
+            overflow-y: auto;
+        }
+        .debug-panel h3 {
+            margin-top: 0;
+            color: #333;
+        }
+        .debug-item {
+            margin: 5px 0;
+            padding: 3px 0;
+            border-bottom: 1px solid #eee;
+        }
+        .debug-label {
+            font-weight: bold;
+            color: #666;
+            display: inline-block;
+            width: 150px;
+        }
+        .debug-value {
+            color: #000;
+        }
+        .debug-error {
+            color: #d32f2f;
+        }
+        .debug-success {
+            color: #388e3c;
+        }
+        .debug-warning {
+            color: #f57c00;
+        }
     </style>
     <script src="https://cdn.socket.io/4.5.4/socket.io.min.js"></script>
 </head>
 <body>
     <div class="container">
-        <h1>PersonaPlex 实时翻译</h1>
+        <h1>PersonaPlex 实时对话</h1>
         
         <div class="status" id="status">状态: 未连接</div>
         <div class="status" id="volumeStatus" style="display: none;">
@@ -89,7 +127,49 @@
         </div>
         
         <div id="output" style="margin-top: 20px; padding: 10px; background: white; border-radius: 5px; min-height: 100px;">
-            <p>翻译结果将显示在这里...</p>
+            <p>对话响应将显示在这里...</p>
+        </div>
+        
+        <div class="debug-panel">
+            <h3>🔍 调试信息</h3>
+            <div id="debugInfo">
+                <div class="debug-item">
+                    <span class="debug-label">连接状态:</span>
+                    <span class="debug-value" id="debugConnection">未连接</span>
+                </div>
+                <div class="debug-item">
+                    <span class="debug-label">模型状态:</span>
+                    <span class="debug-value" id="debugModel">未加载</span>
+                </div>
+                <div class="debug-item">
+                    <span class="debug-label">请求计数:</span>
+                    <span class="debug-value" id="debugRequests">0</span>
+                </div>
+                <div class="debug-item">
+                    <span class="debug-label">成功/失败:</span>
+                    <span class="debug-value" id="debugSuccessFail">0 / 0</span>
+                </div>
+                <div class="debug-item">
+                    <span class="debug-label">平均处理时间:</span>
+                    <span class="debug-value" id="debugAvgTime">0.00s</span>
+                </div>
+                <div class="debug-item">
+                    <span class="debug-label">GPU 内存:</span>
+                    <span class="debug-value" id="debugMemory">-</span>
+                </div>
+                <div class="debug-item">
+                    <span class="debug-label">队列状态:</span>
+                    <span class="debug-value" id="debugQueue">-</span>
+                </div>
+                <div class="debug-item">
+                    <span class="debug-label">最后请求时间:</span>
+                    <span class="debug-value" id="debugLastRequest">-</span>
+                </div>
+                <div class="debug-item">
+                    <span class="debug-label">最后处理时间:</span>
+                    <span class="debug-value" id="debugLastProcess">-</span>
+                </div>
+            </div>
         </div>
     </div>
 
@@ -127,27 +207,84 @@
 
         // Socket.IO 连接
         socket.on('connect', () => {
+            console.log('✓ [DEBUG] WebSocket 已连接');
             document.getElementById('status').textContent = '状态: 已连接';
+            updateDebugInfo();
         });
 
         socket.on('disconnect', () => {
+            console.log('✗ [DEBUG] WebSocket 已断开');
             document.getElementById('status').textContent = '状态: 未连接';
+            updateDebugInfo();
         });
 
         socket.on('translated_audio', (data) => {
-            // 播放翻译后的音频
-            console.log('✓ 收到翻译结果');
+            // 播放对话响应音频
+            console.log('✓ [DEBUG] 收到对话响应');
             document.getElementById('audioStatus').textContent = '收到回复';
             document.getElementById('audioStatus').style.color = 'green';
+            updateDebugInfo(); // 更新调试信息
             const audio = new Audio('data:audio/wav;base64,' + data.audio);
             audio.play();
         });
         
         socket.on('audio_error', (data) => {
-            console.error('音频错误:', data.error);
+            console.error('✗ [DEBUG] 音频错误:', data.error);
             document.getElementById('audioStatus').textContent = '错误: ' + data.error;
             document.getElementById('audioStatus').style.color = 'red';
+            updateDebugInfo(); // 更新调试信息
         });
+        
+        // 更新调试信息
+        async function updateDebugInfo() {
+            try {
+                const response = await fetch('/api/status');
+                const status = await response.json();
+                
+                document.getElementById('debugConnection').textContent = 
+                    status.model_loaded ? '已连接' : '未连接';
+                document.getElementById('debugConnection').className = 
+                    status.model_loaded ? 'debug-value debug-success' : 'debug-value debug-error';
+                
+                document.getElementById('debugModel').textContent = 
+                    status.model_loaded ? '已加载' : '未加载';
+                document.getElementById('debugModel').className = 
+                    status.model_loaded ? 'debug-value debug-success' : 'debug-value debug-error';
+                
+                if (status.debug_stats) {
+                    document.getElementById('debugRequests').textContent = 
+                        status.debug_stats.total_requests || 0;
+                    document.getElementById('debugSuccessFail').textContent = 
+                        `${status.debug_stats.successful_requests || 0} / ${status.debug_stats.failed_requests || 0}`;
+                    document.getElementById('debugSuccessFail').className = 
+                        status.debug_stats.failed_requests > 0 ? 'debug-value debug-warning' : 'debug-value debug-success';
+                    
+                    document.getElementById('debugAvgTime').textContent = 
+                        (status.debug_stats.avg_processing_time || 0).toFixed(2) + 's';
+                    
+                    if (status.debug_stats.memory_info) {
+                        const mem = status.debug_stats.memory_info;
+                        document.getElementById('debugMemory').textContent = 
+                            `${mem.allocated_mb || 0}MB / ${mem.reserved_mb || 0}MB (可用: ${mem.free_mb || 0}MB)`;
+                    }
+                    
+                    document.getElementById('debugLastRequest').textContent = 
+                        status.debug_stats.last_request_time || '-';
+                    document.getElementById('debugLastProcess').textContent = 
+                        (status.debug_stats.last_processing_time || 0).toFixed(2) + 's';
+                }
+                
+                document.getElementById('debugQueue').textContent = 
+                    `队列: ${status.queue_size || 0} | 处理中: ${status.is_processing ? '是' : '否'}`;
+                document.getElementById('debugQueue').className = 
+                    status.is_processing ? 'debug-value debug-warning' : 'debug-value';
+            } catch (error) {
+                console.error('获取调试信息失败:', error);
+            }
+        }
+        
+        // 定期更新调试信息
+        setInterval(updateDebugInfo, 2000); // 每2秒更新一次
 
         // 加载模型
         async function loadModel() {
@@ -261,7 +398,8 @@
                                     const sourceLang = document.getElementById('sourceLang').value;
                                     const targetLang = document.getElementById('targetLang').value;
                                     
-                                    console.log('✓ 发送音频数据，RMS:', rms.toFixed(4), '长度:', audioDuration.toFixed(2), '秒');
+                                    const sendTime = new Date().toLocaleTimeString();
+                                    console.log(`✓ [DEBUG] 发送音频数据 | 时间: ${sendTime} | RMS: ${rms.toFixed(4)} | 长度: ${audioDuration.toFixed(2)}秒 | 大小: ${audioArray.length} 字节`);
                                     document.getElementById('audioStatus').textContent = '发送中...';
                                     document.getElementById('audioStatus').style.color = 'blue';
                                     
@@ -270,6 +408,9 @@
                                         source_lang: sourceLang,
                                         target_lang: targetLang
                                     });
+                                    
+                                    // 更新调试信息
+                                    setTimeout(updateDebugInfo, 500);
                                     
                                     // 发送后重置状态
                                     audioChunks = [];
