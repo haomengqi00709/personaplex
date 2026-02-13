@@ -248,19 +248,24 @@ def process_audio_chunk(audio_data, text_prompt, voice_prompt_path=None):
             
             # 处理音频帧
             generated_frames = []
+            # 确保音频数据是 float32
+            if audio_data.dtype != np.float32:
+                audio_data = audio_data.astype(np.float32)
+            
             audio_tensor = torch.from_numpy(audio_data).float()
             if audio_tensor.dim() == 1:
                 audio_tensor = audio_tensor.unsqueeze(0)  # (1, T)
             audio_tensor = audio_tensor.to(device)
             
-            # 将音频分成帧并处理
-            all_pcm_data = audio_tensor[0].cpu().numpy()
+            # 将音频分成帧并处理（保持 float32）
+            all_pcm_data = audio_tensor[0].cpu().numpy().astype(np.float32)
             
             while all_pcm_data.shape[-1] >= frame_size:
                 chunk = all_pcm_data[:frame_size]
                 all_pcm_data = all_pcm_data[frame_size:]
                 
-                chunk_tensor = torch.from_numpy(chunk).to(device)[None, None]  # (1, 1, frame_size)
+                # 明确指定 dtype 为 float32
+                chunk_tensor = torch.from_numpy(chunk.astype(np.float32)).float().to(device)[None, None]  # (1, 1, frame_size)
                 
                 # 编码
                 codes = mimi.encode(chunk_tensor)
@@ -280,10 +285,10 @@ def process_audio_chunk(audio_data, text_prompt, voice_prompt_path=None):
             
             # 处理剩余的音频
             if all_pcm_data.shape[-1] > 0:
-                # 填充到 frame_size
-                padding = np.zeros(frame_size - all_pcm_data.shape[-1])
+                # 填充到 frame_size（确保 float32）
+                padding = np.zeros(frame_size - all_pcm_data.shape[-1], dtype=np.float32)
                 chunk = np.concatenate([all_pcm_data, padding])
-                chunk_tensor = torch.from_numpy(chunk).to(device)[None, None]
+                chunk_tensor = torch.from_numpy(chunk.astype(np.float32)).float().to(device)[None, None]
                 codes = mimi.encode(chunk_tensor)
                 _ = other_mimi.encode(chunk_tensor)
                 for c in range(codes.shape[-1]):
@@ -416,7 +421,8 @@ def handle_audio_chunk(data):
         temp_path = temp_input.name
         
         try:
-            audio_data, sr = librosa.load(temp_path, sr=model_state['sample_rate'])
+            # 明确指定 dtype 为 float32
+            audio_data, sr = librosa.load(temp_path, sr=model_state['sample_rate'], dtype=np.float32)
             print(f"收到音频: {len(audio_data)} 采样点 ({len(audio_data)/sr:.1f} 秒)")
         except Exception as e:
             print(f"音频加载错误: {e}")
