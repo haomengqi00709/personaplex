@@ -174,7 +174,15 @@
     </div>
 
     <script>
-        const socket = io();
+        // 配置 Socket.IO 连接，减少不必要的重连
+        const socket = io({
+            reconnection: true,
+            reconnectionDelay: 1000,
+            reconnectionDelayMax: 5000,
+            reconnectionAttempts: 5,
+            timeout: 20000,
+            transports: ['websocket', 'polling']
+        });
         let isRecording = false;
         let audioContext = null;
         let processor = null;
@@ -207,15 +215,36 @@
 
         // Socket.IO 连接
         socket.on('connect', () => {
-            console.log('✓ [DEBUG] WebSocket 已连接');
+            const time = new Date().toLocaleTimeString();
+            console.log(`✓ [DEBUG] WebSocket 已连接 | 时间: ${time} | Socket ID: ${socket.id}`);
             document.getElementById('status').textContent = '状态: 已连接';
+            document.getElementById('status').style.color = 'green';
             updateDebugInfo();
         });
 
-        socket.on('disconnect', () => {
-            console.log('✗ [DEBUG] WebSocket 已断开');
-            document.getElementById('status').textContent = '状态: 未连接';
+        socket.on('disconnect', (reason) => {
+            const time = new Date().toLocaleTimeString();
+            console.log(`✗ [DEBUG] WebSocket 已断开 | 时间: ${time} | 原因: ${reason}`);
+            document.getElementById('status').textContent = `状态: 未连接 (${reason})`;
+            document.getElementById('status').style.color = 'red';
             updateDebugInfo();
+        });
+        
+        socket.on('connect_error', (error) => {
+            console.error('✗ [DEBUG] WebSocket 连接错误:', error);
+        });
+        
+        socket.on('reconnect', (attemptNumber) => {
+            const time = new Date().toLocaleTimeString();
+            console.log(`↻ [DEBUG] WebSocket 重连成功 | 时间: ${time} | 尝试次数: ${attemptNumber}`);
+        });
+        
+        socket.on('reconnect_attempt', (attemptNumber) => {
+            console.log(`↻ [DEBUG] 正在尝试重连... | 尝试次数: ${attemptNumber}`);
+        });
+        
+        socket.on('reconnect_failed', () => {
+            console.error('✗ [DEBUG] WebSocket 重连失败');
         });
 
         socket.on('translated_audio', (data) => {
