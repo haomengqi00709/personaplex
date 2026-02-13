@@ -247,12 +247,14 @@ def process_audio_chunk(audio_data, text_prompt, voice_prompt_path=None):
     debug_stats['memory_usage_mb'] = mem_info['allocated_mb']
     print(f"📊 [DEBUG] 请求 #{debug_stats['total_requests']} | 内存: {mem_info['allocated_mb']:.1f}MB / {mem_info['reserved_mb']:.1f}MB | 可用: {mem_info['free_mb']:.1f}MB")
     
-    # 检查音频长度（限制最大长度，平衡响应速度和完整性）
-    # 增加到5秒，允许更完整的句子，同时保持合理的处理时间
-    max_samples = model_state['sample_rate'] * 5  # 最多5秒
-    if len(audio_data) > max_samples:
-        print(f"⚠️  [WARN] 音频太长 ({len(audio_data)} 采样点，{len(audio_data)/model_state['sample_rate']:.2f}秒)，截断到 {max_samples} ({max_samples/model_state['sample_rate']:.2f}秒)")
-        audio_data = audio_data[:max_samples]
+    # 移除音频长度限制，允许完整处理
+    # 只保留极端情况的安全检查（超过60秒可能是错误）
+    max_samples_safety = model_state['sample_rate'] * 60  # 安全上限：60秒（防止极端情况）
+    if len(audio_data) > max_samples_safety:
+        print(f"⚠️  [WARN] 音频异常长 ({len(audio_data)} 采样点，{len(audio_data)/model_state['sample_rate']:.2f}秒)，可能是错误，截断到安全上限 {max_samples_safety} ({max_samples_safety/model_state['sample_rate']:.2f}秒)")
+        audio_data = audio_data[:max_samples_safety]
+    else:
+        print(f"✓ [AUDIO] 音频长度: {len(audio_data)} 采样点 ({len(audio_data)/model_state['sample_rate']:.2f}秒) - 完整处理")
     
     # 处理前清理 CUDA 缓存
     clear_memory()

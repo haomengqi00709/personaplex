@@ -197,7 +197,7 @@
         let silenceThresholdFrames = 8; // 连续静音多少帧后认为说话结束（约0.17秒，24000/4096*8）- 减少以更快响应
         let hasSpeechInBuffer = false; // 缓冲区中是否有语音
         let lastSpeechTime = 0; // 最后一次检测到语音的时间
-        let maxAudioDuration = 4.0; // 最大音频长度（秒），超过这个长度立即发送
+        let maxAudioDuration = 30.0; // 最大音频长度（秒），超过这个长度立即发送（安全上限，防止极端情况）
 
         // 计算音频音量（RMS）
         function calculateRMS(audioData) {
@@ -368,9 +368,10 @@
                         consecutiveSilenceCount++;
                     }
                     
-                    // 限制音频块数量，避免内存溢出（限制到约4秒，24000*4/4096≈23块）
-                    const maxChunks = Math.ceil(24000 * maxAudioDuration / 4096); // 约23块
+                    // 限制音频块数量，避免内存溢出（限制到约30秒，24000*30/4096≈176块）
+                    const maxChunks = Math.ceil(24000 * maxAudioDuration / 4096); // 约176块
                     if (audioChunks.length > maxChunks) {
+                        console.warn(`⚠️ [WARN] 音频块数量过多 (${audioChunks.length})，移除最旧的块`);
                         audioChunks.shift(); // 移除最旧的块
                     }
                 };
@@ -402,7 +403,7 @@
                                                    audioDuration >= minAudioLength &&
                                                    timeSinceLastSpeech >= 0.2; // 至少0.2秒没说话了
                         
-                        // 条件2: 音频达到最大长度（4秒），立即发送（避免积累太长）
+                        // 条件2: 音频达到安全上限（30秒），立即发送（防止极端情况）
                         const shouldSendOnMaxLength = audioDuration >= maxAudioDuration && hasSpeechInBuffer;
                         
                         // 只在有有效语音且满足发送条件时才发送
