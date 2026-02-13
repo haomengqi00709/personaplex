@@ -247,11 +247,11 @@ def process_audio_chunk(audio_data, text_prompt, voice_prompt_path=None):
     debug_stats['memory_usage_mb'] = mem_info['allocated_mb']
     print(f"📊 [DEBUG] 请求 #{debug_stats['total_requests']} | 内存: {mem_info['allocated_mb']:.1f}MB / {mem_info['reserved_mb']:.1f}MB | 可用: {mem_info['free_mb']:.1f}MB")
     
-    # 检查音频长度（限制最大长度，加快处理速度）
-    # 限制到3秒，加快响应速度
-    max_samples = model_state['sample_rate'] * 3  # 最多3秒（加快处理）
+    # 检查音频长度（限制最大长度，平衡响应速度和完整性）
+    # 增加到5秒，允许更完整的句子，同时保持合理的处理时间
+    max_samples = model_state['sample_rate'] * 5  # 最多5秒
     if len(audio_data) > max_samples:
-        print(f"⚠️  [WARN] 音频太长 ({len(audio_data)} 采样点)，截断到 {max_samples}")
+        print(f"⚠️  [WARN] 音频太长 ({len(audio_data)} 采样点，{len(audio_data)/model_state['sample_rate']:.2f}秒)，截断到 {max_samples} ({max_samples/model_state['sample_rate']:.2f}秒)")
         audio_data = audio_data[:max_samples]
     
     # 处理前清理 CUDA 缓存
@@ -270,8 +270,12 @@ def process_audio_chunk(audio_data, text_prompt, voice_prompt_path=None):
             global conversation_active, last_audio_time
             current_time = time.time()
             
-            # 如果距离上次处理超过5秒，认为是新对话
-            is_new_conversation = not conversation_active or (current_time - last_audio_time) > 5.0
+            # 如果距离上次处理超过10秒，认为是新对话（增加时间窗口，减少重新初始化）
+            time_since_last = current_time - last_audio_time if last_audio_time > 0 else 999
+            is_new_conversation = not conversation_active or time_since_last > 10.0
+            
+            if not is_new_conversation:
+                print(f"⏱️  [TIME] 距离上次请求: {time_since_last:.1f}秒（继续对话，跳过初始化）")
             
             if is_new_conversation:
                 print(f"🔄 [NEW_CONV] 开始新对话 #{debug_stats['total_requests']}，初始化系统提示...")
@@ -309,13 +313,11 @@ def process_audio_chunk(audio_data, text_prompt, voice_prompt_path=None):
                 init_time = time.time() - init_start
                 print(f"✓ [INIT] 系统提示初始化完成，耗时: {init_time:.2f}秒")
             else:
-                print(f"➡️  [CONTINUE] 继续对话 #{debug_stats['total_requests']}，跳过系统提示初始化")
+                print(f"➡️  [CONTINUE] 继续对话 #{debug_stats['total_requests']}，跳过系统提示初始化（节省约2.3秒）")
                 # 继续对话，只重置流式状态，不重新运行系统提示
                 mimi.reset_streaming()
                 other_mimi.reset_streaming()
                 lm_gen.reset_streaming()
-            
-            last_audio_time = current_time
             
             audio_duration = len(audio_data) / sample_rate
             print(f"🎤 [AUDIO] 开始处理音频 | 采样点: {len(audio_data)} | 时长: {audio_duration:.2f}秒")
@@ -427,6 +429,10 @@ def process_audio_chunk(audio_data, text_prompt, voice_prompt_path=None):
             mem_info = get_memory_usage()
             print(f"✓ [DONE] 处理完成 | 总耗时: {total_time:.2f}s | 处理耗时: {elapsed:.2f}s | 输出时长: {output_duration:.2f}s")
             print(f"📊 [MEMORY] 处理后内存: {mem_info['allocated_mb']:.1f}MB / {mem_info['reserved_mb']:.1f}MB | 可用: {mem_info['free_mb']:.1f}MB")
+            
+            # 在处理完成后更新 last_audio_time（这样下次请求时，时间窗口更准确）
+            global last_audio_time
+            last_audio_time = time.time()
             
             return output_audio
             
