@@ -306,16 +306,19 @@ def handle_audio_chunk(data):
             socketio.emit('audio_error', {'error': 'Processing queue is full, please wait'})
             return
         
-        # 创建翻译提示词（使用 PersonaPlex 的 system 标签格式）
-        lang_names = {
-            "en": "English", "zh": "Chinese", "es": "Spanish", "fr": "French",
-            "de": "German", "ja": "Japanese", "ko": "Korean"
-        }
-        source_name = lang_names.get(source_lang, source_lang)
-        target_name = lang_names.get(target_lang, target_lang)
+        # 创建提示词
+        # 先测试基本对话功能，使用 PersonaPlex 的标准对话 prompt
+        # 暂时固定使用简单的对话 prompt，测试模型是否能正常对话
+        text_prompt = "You enjoy having a good conversation."
         
-        # 使用 <system> 标签包裹，让模型明确这是翻译任务
-        text_prompt = f"""<system> You are a professional real-time translator. Your ONLY job is to translate speech from {source_name} to {target_name}. Do NOT introduce yourself. Do NOT have conversations. ONLY translate what the user says. Always respond in {target_name} only. Never speak in {source_name}. <system>"""
+        # TODO: 等基本对话正常后，再添加翻译功能
+        # lang_names = {
+        #     "en": "English", "zh": "Chinese", "es": "Spanish", "fr": "French",
+        #     "de": "German", "ja": "Japanese", "ko": "Korean"
+        # }
+        # source_name = lang_names.get(source_lang, source_lang)
+        # target_name = lang_names.get(target_lang, target_lang)
+        # text_prompt = f"You are a translator. Translate speech from {source_name} to {target_name}. Always respond in {target_name} only."
         
         # 定义回调函数
         def send_result(translated_audio):
