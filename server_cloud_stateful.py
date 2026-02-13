@@ -231,7 +231,7 @@ def load_personaplex_model():
 
 def process_audio_chunk(audio_data, text_prompt, voice_prompt_path=None):
     """处理音频块 - 使用已加载的模型状态"""
-    global model_state, debug_stats
+    global model_state, debug_stats, last_audio_time
     
     request_start_time = time.time()
     debug_stats['total_requests'] += 1
@@ -431,7 +431,6 @@ def process_audio_chunk(audio_data, text_prompt, voice_prompt_path=None):
             print(f"📊 [MEMORY] 处理后内存: {mem_info['allocated_mb']:.1f}MB / {mem_info['reserved_mb']:.1f}MB | 可用: {mem_info['free_mb']:.1f}MB")
             
             # 在处理完成后更新 last_audio_time（这样下次请求时，时间窗口更准确）
-            global last_audio_time
             last_audio_time = time.time()
             
             return output_audio
