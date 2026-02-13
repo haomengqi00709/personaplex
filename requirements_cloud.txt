@@ -1,0 +1,29 @@
+# PersonaPlex 云端 GPU 部署依赖
+# 使用 CUDA 版本的 PyTorch
+
+# PyTorch (CUDA 11.8)
+# 注意：根据你的 CUDA 版本选择，云端 GPU 通常是 CUDA 11.8 或 12.1
+# 安装命令：pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118
+
+# 核心依赖
+transformers>=4.40.0
+accelerate>=0.20.0
+sentencepiece>=0.1.99
+protobuf>=3.20.0
+huggingface-hub>=0.20.0
+
+# 音频处理
+soundfile>=0.12.1
+librosa>=0.10.0
+numpy>=1.24.0
+scipy>=1.10.0
+
+# Web 服务器
+flask>=2.3.0
+flask-cors>=4.0.0
+flask-socketio>=5.3.0
+python-socketio>=5.10.0
+
+# PersonaPlex 需要（需要从源码安装）
+# pip install -e personaplex/moshi/
+
