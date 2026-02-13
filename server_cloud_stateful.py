@@ -42,6 +42,8 @@ socketio = SocketIO(app, cors_allowed_origins="*", async_mode='threading')
 # 全局变量 - 模型状态
 model_state = None
 model_lock = threading.Lock()
+conversation_active = False  # 跟踪是否有活跃对话
+last_audio_time = 0  # 上次处理音频的时间
 
 # 自动检测设备（优先 CUDA，云端 GPU 使用）
 device = "cuda" if torch.cuda.is_available() else ("mps" if hasattr(torch.backends, 'mps') and torch.backends.mps.is_available() else "cpu")
@@ -53,8 +55,9 @@ else:
     print(f"⚠️  未检测到 CUDA GPU，使用设备: {device}")
 
 # 处理队列（限制并发，避免内存溢出）
-processing_queue = queue.Queue(maxsize=2)  # 最多2个请求排队
+processing_queue = queue.Queue(maxsize=1)  # 最多1个请求排队（减少同时回复）
 is_processing = False
+pending_requests = set()  # 跟踪正在处理的请求（用于去重）
 
 def clear_memory():
     """清理内存"""
@@ -194,14 +197,15 @@ def load_personaplex_model():
 
 def process_audio_chunk(audio_data, text_prompt, voice_prompt_path=None):
     """处理音频块 - 使用已加载的模型状态"""
-    global model_state, is_processing
+    global model_state
     
     if model_state is None:
         print("✗ 模型未加载")
         return None
     
     # 检查音频长度（限制最大长度，减少内存使用）
-    max_samples = model_state['sample_rate'] * 5  # 最多5秒（减少内存压力）
+    # 增加到10秒，允许更长的句子
+    max_samples = model_state['sample_rate'] * 10  # 最多10秒
     if len(audio_data) > max_samples:
         print(f"⚠️  音频太长 ({len(audio_data)} 采样点)，截断到 {max_samples}")
         audio_data = audio_data[:max_samples]
@@ -219,35 +223,52 @@ def process_audio_chunk(audio_data, text_prompt, voice_prompt_path=None):
             frame_size = model_state['frame_size']
             sample_rate = model_state['sample_rate']
             
-            # 重置流式状态（开始新对话）
-            mimi.reset_streaming()
-            other_mimi.reset_streaming()
-            lm_gen.reset_streaming()
+            global conversation_active, last_audio_time
+            current_time = time.time()
             
-            # 设置 text prompt
-            if text_prompt:
-                wrapped_prompt = wrap_with_system_tags(text_prompt)
-                lm_gen.text_prompt_tokens = text_tokenizer.encode(wrapped_prompt) if wrapped_prompt else None
-            else:
-                lm_gen.text_prompt_tokens = None
+            # 如果距离上次处理超过5秒，认为是新对话
+            is_new_conversation = not conversation_active or (current_time - last_audio_time) > 5.0
             
-            # 设置 voice prompt
-            if voice_prompt_path is None:
-                voice_prompt_dir = model_state['voice_prompt_dir']
-                voice_prompt_path = os.path.join(voice_prompt_dir, "NATF2.pt")
-                if not os.path.exists(voice_prompt_path):
-                    # 尝试其他路径
-                    voice_prompt_path = "NATF2.pt"
-            
-            if os.path.exists(voice_prompt_path):
-                if voice_prompt_path.endswith('.pt'):
-                    lm_gen.load_voice_prompt_embeddings(voice_prompt_path)
+            if is_new_conversation:
+                print("🔄 开始新对话，初始化系统提示...")
+                # 重置流式状态（开始新对话）
+                mimi.reset_streaming()
+                other_mimi.reset_streaming()
+                lm_gen.reset_streaming()
+                
+                # 设置 text prompt
+                if text_prompt:
+                    wrapped_prompt = wrap_with_system_tags(text_prompt)
+                    lm_gen.text_prompt_tokens = text_tokenizer.encode(wrapped_prompt) if wrapped_prompt else None
                 else:
-                    lm_gen.load_voice_prompt(voice_prompt_path)
+                    lm_gen.text_prompt_tokens = None
+                
+                # 设置 voice prompt
+                if voice_prompt_path is None:
+                    voice_prompt_dir = model_state['voice_prompt_dir']
+                    voice_prompt_path = os.path.join(voice_prompt_dir, "NATF2.pt")
+                    if not os.path.exists(voice_prompt_path):
+                        # 尝试其他路径
+                        voice_prompt_path = "NATF2.pt"
+                
+                if os.path.exists(voice_prompt_path):
+                    if voice_prompt_path.endswith('.pt'):
+                        lm_gen.load_voice_prompt_embeddings(voice_prompt_path)
+                    else:
+                        lm_gen.load_voice_prompt(voice_prompt_path)
+                
+                # 运行系统提示阶段（只在新对话时运行，这是最耗时的步骤）
+                lm_gen.step_system_prompts(mimi)
+                mimi.reset_streaming()  # 重置 mimi 流式状态
+                conversation_active = True
+            else:
+                print("➡️  继续对话，跳过系统提示初始化")
+                # 继续对话，只重置流式状态，不重新运行系统提示
+                mimi.reset_streaming()
+                other_mimi.reset_streaming()
+                lm_gen.reset_streaming()
             
-            # 运行系统提示阶段
-            lm_gen.step_system_prompts(mimi)
-            mimi.reset_streaming()  # 重置 mimi 流式状态
+            last_audio_time = current_time
             
             print(f"开始处理音频（{len(audio_data)} 采样点，约 {len(audio_data)/sample_rate:.1f} 秒）...")
             start_time = time.time()
@@ -355,32 +376,45 @@ def process_audio_chunk(audio_data, text_prompt, voice_prompt_path=None):
         clear_memory()
         return None
     finally:
-        is_processing = False
+        # 注意：is_processing 在 process_queue 中管理，这里不重置
         # 最后清理一次
         clear_memory()
 
 def process_queue():
     """处理队列中的请求"""
+    global is_processing
     while True:
         try:
             item = processing_queue.get(timeout=30)
             if item is None:
                 break
             
+            # 标记开始处理
+            is_processing = True
+            
             audio_data, text_prompt, source_lang, target_lang, callback = item
             
+            # 处理音频
             translated_audio = process_audio_chunk(audio_data, text_prompt)
             
+            # 回调发送结果
             if callback:
                 callback(translated_audio)
             
+            # 标记处理完成
+            is_processing = False
             processing_queue.task_done()
+            
+            # 短暂延迟，避免连续处理太快
+            time.sleep(0.1)
+            
         except queue.Empty:
             continue
         except Exception as e:
             print(f"队列处理错误: {e}")
             import traceback
             traceback.print_exc()
+            is_processing = False
 
 # 启动队列处理线程
 queue_thread = threading.Thread(target=process_queue, daemon=True)
@@ -472,10 +506,10 @@ def handle_audio_chunk(data):
             if os.path.exists(temp_path):
                 os.unlink(temp_path)
         
-        # 检查队列是否已满
-        if processing_queue.full():
-            print("⚠️  处理队列已满，跳过此请求")
-            socketio.emit('audio_error', {'error': 'Processing queue is full, please wait'})
+        # 检查队列是否已满或正在处理
+        if processing_queue.full() or is_processing:
+            print("⚠️  正在处理其他请求，跳过此请求（避免重复回复）")
+            socketio.emit('audio_error', {'error': 'Another request is being processed, please wait'})
             return
         
         # 创建提示词 - 简单对话测试

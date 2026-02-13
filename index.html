@@ -51,6 +51,11 @@
         <h1>PersonaPlex 实时翻译</h1>
         
         <div class="status" id="status">状态: 未连接</div>
+        <div class="status" id="volumeStatus" style="display: none;">
+            音量: <span id="volumeValue">0.0000</span> | 
+            最大音量: <span id="maxVolumeValue">0.0000</span> | 
+            状态: <span id="audioStatus">等待中...</span>
+        </div>
         
         <div>
             <button id="loadModelBtn">加载模型</button>
@@ -73,10 +78,10 @@
         
         <div style="margin: 10px 0;">
             <label>静音阈值:</label>
-            <input type="range" id="silenceThreshold" min="0.001" max="0.1" step="0.001" value="0.01" 
+            <input type="range" id="silenceThreshold" min="0.001" max="0.1" step="0.001" value="0.005" 
                    oninput="document.getElementById('thresholdValue').textContent = this.value">
-            <span id="thresholdValue">0.01</span>
-            <small style="display: block; color: #666;">值越小越敏感，建议 0.01-0.03</small>
+            <span id="thresholdValue">0.005</span>
+            <small style="display: block; color: #666;">值越小越敏感，建议 0.003-0.01。观察上方"最大音量"来调整</small>
         </div>
         
         <div>
@@ -96,10 +101,14 @@
         let stream = null;
         let audioChunks = [];
         let sendInterval = null;
-        let silenceThreshold = 0.01; // 静音阈值（可调整，0.01 表示非常安静）
-        let minAudioLength = 0.5; // 最小音频长度（秒），避免发送太短的音频
-        let consecutiveSilenceFrames = 0;
-        let maxSilenceFrames = 10; // 连续静音帧数，超过这个值才认为是静音
+        let silenceThreshold = 0.005; // 静音阈值（降低默认值，更敏感）
+        let minAudioLength = 0.3; // 最小音频长度（秒），降低到0.3秒
+        let maxSilenceFrames = 30; // 连续静音帧数，增加这个值
+        let currentRMS = 0; // 当前音量
+        let maxRMS = 0; // 最大音量（用于显示）
+        let consecutiveSilenceCount = 0; // 连续静音计数
+        let silenceThresholdFrames = 15; // 连续静音多少帧后认为说话结束（约0.5秒，24000/4096*15）
+        let hasSpeechInBuffer = false; // 缓冲区中是否有语音
 
         // 计算音频音量（RMS）
         function calculateRMS(audioData) {
@@ -127,8 +136,17 @@
 
         socket.on('translated_audio', (data) => {
             // 播放翻译后的音频
+            console.log('✓ 收到翻译结果');
+            document.getElementById('audioStatus').textContent = '收到回复';
+            document.getElementById('audioStatus').style.color = 'green';
             const audio = new Audio('data:audio/wav;base64,' + data.audio);
             audio.play();
+        });
+        
+        socket.on('audio_error', (data) => {
+            console.error('音频错误:', data.error);
+            document.getElementById('audioStatus').textContent = '错误: ' + data.error;
+            document.getElementById('audioStatus').style.color = 'red';
         });
 
         // 加载模型
@@ -154,26 +172,44 @@
                 
                 processor.onaudioprocess = (e) => {
                     const inputData = e.inputBuffer.getChannelData(0);
-                    // 检测是否有声音
-                    const rms = calculateRMS(inputData);
-                    const hasSpeech = rms > silenceThreshold;
+                    // 计算音量
+                    currentRMS = calculateRMS(inputData);
+                    if (currentRMS > maxRMS) {
+                        maxRMS = currentRMS;
+                    }
                     
+                    // 检测是否有语音
+                    const hasSpeech = currentRMS > silenceThreshold;
+                    
+                    // 更新显示
+                    if (isRecording) {
+                        document.getElementById('volumeValue').textContent = currentRMS.toFixed(4);
+                        document.getElementById('maxVolumeValue').textContent = maxRMS.toFixed(4);
+                        document.getElementById('audioStatus').textContent = hasSpeech ? '检测到语音' : '静音';
+                        document.getElementById('audioStatus').style.color = hasSpeech ? 'green' : 'gray';
+                    }
+                    
+                    // 收集所有音频块
+                    audioChunks.push(new Float32Array(inputData));
+                    
+                    // 跟踪是否有语音
                     if (hasSpeech) {
-                        consecutiveSilenceFrames = 0;
-                        audioChunks.push(new Float32Array(inputData));
+                        hasSpeechInBuffer = true;
+                        consecutiveSilenceCount = 0;
                     } else {
-                        consecutiveSilenceFrames++;
-                        // 即使静音，也保留一些音频块，以便在语音结束时发送
-                        if (consecutiveSilenceFrames < maxSilenceFrames) {
-                            audioChunks.push(new Float32Array(inputData));
-                        }
+                        consecutiveSilenceCount++;
+                    }
+                    
+                    // 限制音频块数量，避免内存溢出（增加到200，允许更长的句子）
+                    if (audioChunks.length > 200) {
+                        audioChunks.shift(); // 移除最旧的块
                     }
                 };
                 
                 source.connect(processor);
                 processor.connect(audioContext.destination);
                 
-                // 定期发送音频数据（只在有有效语音时发送）
+                // 智能发送：检测到静音后发送，而不是固定时间间隔
                 sendInterval = setInterval(() => {
                     if (audioChunks.length > 0) {
                         // 合并音频块
@@ -187,10 +223,19 @@
                         
                         // 检查音频长度和是否有有效语音
                         const audioDuration = merged.length / 24000; // 秒
-                        const hasSpeech = hasValidSpeech(merged);
+                        const rms = calculateRMS(merged);
+                        const hasSpeech = rms > silenceThreshold;
                         
-                        // 只在有有效语音且长度足够时才发送
-                        if (hasSpeech && audioDuration >= minAudioLength) {
+                        // 如果检测到连续静音，且之前有语音，则发送（等待用户说完）
+                        const shouldSend = hasSpeechInBuffer && 
+                                         consecutiveSilenceCount >= silenceThresholdFrames && 
+                                         audioDuration >= minAudioLength;
+                        
+                        // 或者音频太长（超过8秒），强制发送（避免内存问题）
+                        const forceSend = audioDuration >= 8.0 && hasSpeech;
+                        
+                        // 只在有有效语音且满足发送条件时才发送
+                        if ((shouldSend || forceSend) && audioDuration >= minAudioLength) {
                             // 转换为 WAV
                             const wavBuffer = audioBufferToWav({
                                 numberOfChannels: 1,
@@ -216,34 +261,43 @@
                                     const sourceLang = document.getElementById('sourceLang').value;
                                     const targetLang = document.getElementById('targetLang').value;
                                     
-                                    const rms = calculateRMS(merged);
-                                    console.log('发送音频数据，RMS:', rms.toFixed(4), '长度:', audioDuration.toFixed(2), '秒');
+                                    console.log('✓ 发送音频数据，RMS:', rms.toFixed(4), '长度:', audioDuration.toFixed(2), '秒');
+                                    document.getElementById('audioStatus').textContent = '发送中...';
+                                    document.getElementById('audioStatus').style.color = 'blue';
+                                    
                                     socket.emit('audio_chunk', {
                                         audio: audioArray,
                                         source_lang: sourceLang,
                                         target_lang: targetLang
                                     });
+                                    
+                                    // 发送后重置状态
+                                    audioChunks = [];
+                                    hasSpeechInBuffer = false;
+                                    consecutiveSilenceCount = 0;
                                 } else {
                                     console.error('音频文件头无效:', headerStr);
                                 }
                             }
                         } else {
-                            if (!hasSpeech) {
-                                console.log('跳过静音音频，RMS 太低');
-                            } else {
-                                console.log('跳过太短的音频:', audioDuration.toFixed(2), '秒');
+                            // 如果还在说话，不发送，继续收集
+                            if (hasSpeech) {
+                                // 继续收集，不发送
+                            } else if (!hasSpeechInBuffer) {
+                                // 没有语音，清空缓冲区（避免积累太多静音）
+                                if (audioChunks.length > 10) {
+                                    audioChunks = audioChunks.slice(-5);
+                                }
                             }
                         }
-                        
-                        // 清空音频块
-                        audioChunks = [];
-                        consecutiveSilenceFrames = 0;
                     }
-                }, 3000);
+                }, 500); // 更频繁地检查（500ms），但只在满足条件时发送
                 
                 isRecording = true;
+                maxRMS = 0; // 重置最大音量
                 document.getElementById('recordBtn').textContent = '⏹️ 停止录音';
                 document.getElementById('recordBtn').classList.add('recording');
+                document.getElementById('volumeStatus').style.display = 'block';
                 
             } catch (error) {
                 console.error('录音失败:', error);
@@ -262,6 +316,8 @@
                 isRecording = false;
                 document.getElementById('recordBtn').textContent = '🎙️ 开始录音';
                 document.getElementById('recordBtn').classList.remove('recording');
+                document.getElementById('volumeStatus').style.display = 'none';
+                document.getElementById('audioStatus').textContent = '已停止';
             }
         }
 
