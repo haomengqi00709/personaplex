@@ -37,7 +37,17 @@ else:
 
 app = Flask(__name__)
 CORS(app)
-socketio = SocketIO(app, cors_allowed_origins="*", async_mode='threading')
+# 优化 Socket.IO 配置，减少连接问题
+socketio = SocketIO(
+    app, 
+    cors_allowed_origins="*", 
+    async_mode='threading',
+    ping_timeout=60,  # 增加 ping 超时时间
+    ping_interval=25,  # 增加 ping 间隔
+    max_http_buffer_size=10*1024*1024,  # 10MB 缓冲区
+    logger=False,  # 关闭 Socket.IO 内部日志（减少噪音）
+    engineio_logger=False
+)
 
 # 全局变量 - 模型状态
 model_state = None
@@ -66,9 +76,10 @@ else:
     print(f"⚠️  未检测到 CUDA GPU，使用设备: {device}")
 
 # 处理队列（限制并发，避免内存溢出）
-processing_queue = queue.Queue(maxsize=1)  # 最多1个请求排队（减少同时回复）
+processing_queue = queue.Queue(maxsize=1)  # 最多1个请求排队
 is_processing = False
-pending_requests = set()  # 跟踪正在处理的请求（用于去重）
+last_request_id = 0  # 请求ID，用于去重
+pending_request_time = 0  # 待处理请求的时间戳
 
 def get_memory_usage():
     """获取内存使用情况（MB）"""
@@ -236,11 +247,11 @@ def process_audio_chunk(audio_data, text_prompt, voice_prompt_path=None):
     debug_stats['memory_usage_mb'] = mem_info['allocated_mb']
     print(f"📊 [DEBUG] 请求 #{debug_stats['total_requests']} | 内存: {mem_info['allocated_mb']:.1f}MB / {mem_info['reserved_mb']:.1f}MB | 可用: {mem_info['free_mb']:.1f}MB")
     
-    # 检查音频长度（限制最大长度，减少内存使用）
-    # 增加到10秒，允许更长的句子
-    max_samples = model_state['sample_rate'] * 10  # 最多10秒
+    # 检查音频长度（限制最大长度，加快处理速度）
+    # 限制到3秒，加快响应速度
+    max_samples = model_state['sample_rate'] * 3  # 最多3秒（加快处理）
     if len(audio_data) > max_samples:
-        print(f"⚠️  音频太长 ({len(audio_data)} 采样点)，截断到 {max_samples}")
+        print(f"⚠️  [WARN] 音频太长 ({len(audio_data)} 采样点)，截断到 {max_samples}")
         audio_data = audio_data[:max_samples]
     
     # 处理前清理 CUDA 缓存
@@ -455,6 +466,7 @@ def process_queue():
             
             # 标记开始处理
             is_processing = True
+            process_start = time.time()
             
             audio_data, text_prompt, source_lang, target_lang, callback = item
             
@@ -462,10 +474,12 @@ def process_queue():
             print(f"🔄 [QUEUE] 开始处理队列中的请求...")
             response_audio = process_audio_chunk(audio_data, text_prompt)
             
+            process_time = time.time() - process_start
+            
             # 回调发送结果
             if callback:
                 if response_audio is not None and len(response_audio) > 0:
-                    print(f"📤 [SEND] 发送响应音频，长度: {len(response_audio)} 采样点")
+                    print(f"📤 [SEND] 发送响应音频，长度: {len(response_audio)} 采样点 | 总处理时间: {process_time:.2f}秒")
                 else:
                     print(f"⚠️  [SEND] 响应音频为空，不发送")
                 callback(response_audio)
@@ -474,7 +488,16 @@ def process_queue():
             is_processing = False
             processing_queue.task_done()
             
-            # 短暂延迟，避免连续处理太快
+            # 清空队列中等待的其他请求（避免堆积，只处理最新的）
+            while not processing_queue.empty():
+                try:
+                    old_item = processing_queue.get_nowait()
+                    print(f"🗑️  [CLEAR] 丢弃队列中的旧请求（避免堆积）")
+                    processing_queue.task_done()
+                except queue.Empty:
+                    break
+            
+            # 短暂延迟
             time.sleep(0.1)
             
         except queue.Empty:
@@ -587,11 +610,27 @@ def handle_audio_chunk(data):
             if os.path.exists(temp_path):
                 os.unlink(temp_path)
         
-        # 检查队列是否已满或正在处理
-        if processing_queue.full() or is_processing:
-            print(f"⚠️  [SKIP] 正在处理其他请求，跳过此请求 | 队列大小: {processing_queue.qsize()} | 正在处理: {is_processing}")
-            socketio.emit('audio_error', {'error': 'Another request is being processed, please wait'})
+        # 检查是否正在处理 - 如果正在处理，直接丢弃新请求（不排队，避免堆积）
+        global is_processing, pending_request_time
+        current_time = time.time()
+        
+        if is_processing:
+            # 如果正在处理，且距离上次请求不到5秒，直接丢弃（避免堆积）
+            if current_time - pending_request_time < 5.0:
+                print(f"⚠️  [SKIP] 正在处理中，丢弃此请求（避免堆积）| 距离上次请求: {current_time - pending_request_time:.1f}秒")
+                socketio.emit('audio_error', {'error': 'Processing, please wait'})
+                return
+            else:
+                # 如果处理时间太长（超过5秒），可能是卡住了，允许新请求
+                print(f"⚠️  [WARN] 处理时间过长，允许新请求")
+        
+        # 检查队列是否已满
+        if processing_queue.full():
+            print(f"⚠️  [SKIP] 队列已满，跳过此请求")
+            socketio.emit('audio_error', {'error': 'Queue is full, please wait'})
             return
+        
+        pending_request_time = current_time
         
         # 创建提示词 - 简单对话测试
         text_prompt = "You enjoy having a good conversation."
